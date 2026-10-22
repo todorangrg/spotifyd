@@ -5,24 +5,27 @@ use color_eyre::{
 };
 use librespot_playback::mixer::{Mixer, MixerConfig};
 use log::error;
-use std::sync::{Arc, Mutex, MutexGuard};
 
 pub fn get_available_controls() -> alsa::Result<HintIter> {
     alsa::device_name::HintIter::new_str(None, "ctl")
 }
 
+/// Opens the alsa mixer anew for every volume call (as spotifyd 0.3 did) instead of keeping the one opened at
+/// startup: a mixer's elements are fixed when it is loaded, so a mixer opened while the device behind it is missing
+/// (e.g. the `pulse` ctl plugin for a Bluetooth sink that is not connected yet, which reports 0 channels and never
+/// sends an INFO event when the sink appears) would stay a silent no-op for the whole process lifetime.
 pub struct AlsaMixer {
-    pub mixer: Arc<Mutex<alsa::Mixer>>,
     pub config: MixerConfig,
 }
 
 impl AlsaMixer {
-    fn get_selem<'a>(
-        &'a self,
-        lock: &'a MutexGuard<'a, alsa::Mixer>,
-    ) -> eyre::Result<alsa::mixer::Selem<'a>> {
+    fn open_mixer(&self) -> eyre::Result<alsa::Mixer> {
+        alsa::Mixer::new(&self.config.device, false).wrap_err("failed to open mixer")
+    }
+
+    fn get_selem<'a>(&self, mixer: &'a alsa::Mixer) -> eyre::Result<alsa::mixer::Selem<'a>> {
         let selem_id = alsa::mixer::SelemId::new(&self.config.control, self.config.index);
-        let selem = lock.find_selem(&selem_id).ok_or_else(|| {
+        let selem = mixer.find_selem(&selem_id).ok_or_else(|| {
             eyre!(
                 "No control with name '{}' in alsa device '{}'",
                 self.config.control,
@@ -31,7 +34,8 @@ impl AlsaMixer {
             .with_suggestion(|| {
                 format!(
                     "maybe try one of the following for 'control':{}",
-                    lock.iter()
+                    mixer
+                        .iter()
                         .filter_map(|elem| {
                             let selem = alsa::mixer::Selem::new(elem)?;
                             if selem.has_playback_volume() {
@@ -50,9 +54,10 @@ impl AlsaMixer {
         })?;
         Ok(selem)
     }
+
     fn set_volume_with_err(&self, volume: u16) -> eyre::Result<()> {
-        let lock = self.mixer.lock().expect("lock shouldn't be poisoned");
-        let elem = self.get_selem(&lock)?;
+        let mixer = self.open_mixer()?;
+        let elem = self.get_selem(&mixer)?;
         let (min, max) = elem.get_playback_volume_range();
 
         let volume_steps = (max - min) as f64;
@@ -70,8 +75,8 @@ impl AlsaMixer {
     }
 
     fn get_volume_with_err(&self) -> eyre::Result<u16> {
-        let lock = self.mixer.lock().expect("lock shouldn't be poisoned");
-        let elem = self.get_selem(&lock)?;
+        let mixer = self.open_mixer()?;
+        let elem = self.get_selem(&mixer)?;
         let (min, max) = elem.get_playback_volume_range();
         let volume_steps = (max - min) as f64;
         let vol = elem.get_playback_volume(alsa::mixer::SelemChannelId::mono())?;
@@ -89,13 +94,11 @@ impl AlsaMixer {
 
 impl Mixer for AlsaMixer {
     fn open(config: MixerConfig) -> Result<AlsaMixer, librespot_core::Error> {
-        let mixer = alsa::Mixer::new(&config.device, false)
+        // Fail early on a device that cannot be opened at all; the handle itself is not kept.
+        alsa::Mixer::new(&config.device, false)
             .wrap_err("failed to open mixer")
             .map_err(librespot_core::Error::invalid_argument)?;
-        Ok(AlsaMixer {
-            mixer: Arc::new(Mutex::new(mixer)),
-            config,
-        })
+        Ok(AlsaMixer { config })
     }
 
     fn volume(&self) -> u16 {
